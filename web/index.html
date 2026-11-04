@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>First Choice | Intercity bus tickets</title>
+  <meta name="description" content="Search intercity buses, pick your exact seat and cancel with a clear refund.">
+  <meta name="theme-color" content="#0E5A4A">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Hanken+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='2' y='5' width='28' height='22' rx='6' fill='%230E5A4A'/%3E%3Cpath d='M9 16h14' stroke='%23F4A300' stroke-width='3' stroke-linecap='round' stroke-dasharray='4 3'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css?v=2">
+</head>
+<body>
+  <a class="skip" href="#app">Skip to content</a>
+  <header class="top" id="top"></header>
+  <main id="app" tabindex="-1"></main>
+
+  <dialog id="authDialog" aria-labelledby="authTitle">
+    <form method="dialog" class="dlg-close"><button aria-label="Close">&times;</button></form>
+    <h2 id="authTitle">Log in</h2>
+    <div class="seg" role="group" aria-label="Log in or create account">
+      <button type="button" data-mode="login" class="on">Log in</button>
+      <button type="button" data-mode="register">Create account</button>
+    </div>
+    <form id="authForm" novalidate>
+      <label class="f reg-only" hidden>Full name<input name="name" autocomplete="name"></label>
+      <label class="f">Email<input name="email" type="email" autocomplete="email" required></label>
+      <label class="f">Password<input name="password" type="password" autocomplete="current-password" minlength="6" required></label>
+      <p class="err" id="authErr" role="alert"></p>
+      <button class="btn primary wide" type="submit" id="authSubmit">Log in</button>
+    </form>
+    <p class="hint">Want to look around first? Demo passenger: user@demo.com / user123</p>
+  </dialog>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="app.js?v=2"></script>
+</body>
+</html>
