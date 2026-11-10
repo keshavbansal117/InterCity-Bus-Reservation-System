@@ -6,7 +6,6 @@ import java.util.*;
 public final class Json {
     private Json() { }
 
-    // ---------- parsing ----------
     @SuppressWarnings("unchecked")
     public static Map<String, Object> parseObject(String text) {
         if (text == null || text.isBlank()) return new LinkedHashMap<>();
@@ -88,14 +87,10 @@ public final class Json {
                     case 'f' -> sb.append('\f');
                     case 'u' -> {
                         if (i + 4 > s.length()) throw bad();
-                        try {
-                            sb.append((char) Integer.parseInt(s.substring(i, i + 4), 16));
-                        } catch (NumberFormatException nfe) {
-                            throw bad();
-                        }
+                        sb.append((char) Integer.parseInt(s.substring(i, i + 4), 16));
                         i += 4;
                     }
-                    default -> sb.append(e);   // \" \\ \/
+                    default -> sb.append(e);
                 }
             }
         }
@@ -104,15 +99,10 @@ public final class Json {
             int start = i;
             while (i < s.length() && "+-0123456789.eE".indexOf(s.charAt(i)) >= 0) i++;
             if (start == i) throw bad();
-            try {
-                return Double.valueOf(s.substring(start, i));
-            } catch (NumberFormatException e) {
-                throw bad();
-            }
+            return Double.valueOf(s.substring(start, i));
         }
     }
 
-    // ---------- writing ----------
     public static String stringify(Object o) {
         StringBuilder sb = new StringBuilder();
         write(sb, o);
@@ -164,8 +154,6 @@ public final class Json {
                 case '\n' -> sb.append("\\n");
                 case '\r' -> sb.append("\\r");
                 case '\t' -> sb.append("\\t");
-                case '\b' -> sb.append("\\b");
-                case '\f' -> sb.append("\\f");
                 default -> { if (c < 0x20) sb.append(String.format("\\u%04x", (int) c)); else sb.append(c); }
             }
         }

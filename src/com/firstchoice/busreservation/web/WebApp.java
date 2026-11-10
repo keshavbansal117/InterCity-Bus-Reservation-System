@@ -1,9 +1,14 @@
 package com.firstchoice.busreservation.web;
 
-import com.firstchoice.busreservation.dao.*;
-import com.firstchoice.busreservation.exception.BookingException;
-import com.firstchoice.busreservation.model.*;
+import com.firstchoice.busreservation.db.Db;
+import com.firstchoice.busreservation.db.Row;
+import com.firstchoice.busreservation.mail.Notifier;
+import com.firstchoice.busreservation.mail.SmtpMailer;
+import com.firstchoice.busreservation.pay.DemoGateway;
+import com.firstchoice.busreservation.pay.PaymentGateway;
+import com.firstchoice.busreservation.pay.RazorpayGateway;
 import com.firstchoice.busreservation.service.*;
+import com.firstchoice.busreservation.util.*;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
@@ -13,399 +18,320 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.SecureRandom;
-import java.time.*;
+import java.time.DateTimeException;
+import java.time.LocalDate;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
-/**
- * Web front end for First Choice. Serves the static site from ./web and a JSON API under /api.
- * Uses only the JDK's built-in HTTP server - no libraries needed.
- *
- * Environment variables (all optional):  PORT (default 8080), WEB_DIR (default "web"), ADMIN_PASSWORD.
- */
-public class WebApp {
-    private static final class ApiException extends Exception {
-        final int status;
-        ApiException(int status, String message) { super(message); this.status = status; }
-    }
-
+/** First Choice web server: static website + JSON API under /api. Runs on the JDK's built-in HTTP server. */
+public final class WebApp {
+    private final Db db;
     private final AuthService auth;
+    private final CatalogService catalog;
+    private final BookingService bookings;
     private final AdminService admin;
-    private final BookingService booking;
-    private final Map<String, User> sessions = new ConcurrentHashMap<>();
-    private final SecureRandom random = new SecureRandom();
+    private final Notifier notifier;
+    private final RateLimiter limiter = new RateLimiter();
     private final Path webRoot;
 
-    public WebApp(Path webRoot) throws Exception {
-        this.webRoot = webRoot;
-        UserDAO userDAO = new InMemoryUserDAO();
-        ScheduleDAO scheduleDAO = new InMemoryScheduleDAO();
-        BookingDAO bookingDAO = new InMemoryBookingDAO();
-        auth = new AuthService(userDAO);
-        admin = new AdminService(scheduleDAO);
-        booking = new BookingService(scheduleDAO, bookingDAO);
-        String adminPw = System.getenv().getOrDefault("ADMIN_PASSWORD", "admin123");
-        DataSeeder.seed(auth, admin, adminPw);
-    }
-
-    public HttpServer startServer(int port) throws IOException {
-        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.createContext("/api/", this::handleApi);
-        server.createContext("/", this::handleStatic);
-        server.setExecutor(Executors.newCachedThreadPool());
-        server.start();
-        return server;
+    private WebApp(Db db, Notifier notifier, PaymentGateway gateway, Path webRoot) {
+        this.db = db; this.notifier = notifier; this.webRoot = webRoot;
+        this.auth = new AuthService(db, notifier, limiter);
+        this.catalog = new CatalogService(db);
+        this.bookings = new BookingService(db, notifier, gateway, catalog);
+        this.admin = new AdminService(db);
     }
 
     public static void main(String[] args) throws Exception {
-        int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "8080"));
-        Path web = Path.of(System.getenv().getOrDefault("WEB_DIR", "web")).toAbsolutePath().normalize();
+        TimeZone.setDefault(TimeZone.getTimeZone(Config.APP_TZ));
+        Path web = Path.of(Config.WEB_DIR).toAbsolutePath().normalize();
         if (!Files.isRegularFile(web.resolve("index.html"))) {
-            System.err.println("Cannot find " + web.resolve("index.html") + " - run this from the project folder.");
+            System.err.println("Cannot find " + web.resolve("index.html") + ". Run this from the project folder.");
             System.exit(1);
         }
-        WebApp app = new WebApp(web);
-        HttpServer server = app.startServer(port);
-        System.out.println("First Choice is running.  Open  http://localhost:" + port + "  in your browser.");
+        Files.createDirectories(Path.of("data"));
+        Db db = new Db(Config.JDBC_URL, Config.JDBC_USER, Config.JDBC_PASSWORD, 8);
+        db.initSchema(Path.of(Config.SCHEMA_FILE));
+
+        SmtpMailer smtp = Config.SMTP_HOST.isEmpty() ? null
+                : new SmtpMailer(Config.SMTP_HOST, Config.SMTP_PORT, Config.SMTP_USER, Config.SMTP_PASSWORD, Config.SMTP_FROM, Config.SMTP_SECURITY);
+        Notifier notifier = new Notifier(db, smtp);
+        boolean razorpay = !Config.RAZORPAY_KEY_ID.isEmpty() && !Config.RAZORPAY_KEY_SECRET.isEmpty();
+        PaymentGateway gateway = razorpay ? new RazorpayGateway(Config.RAZORPAY_KEY_ID, Config.RAZORPAY_KEY_SECRET) : new DemoGateway();
+
+        WebApp app = new WebApp(db, notifier, gateway, web);
+        app.auth.ensureAdmin();
+        if (Config.SEED_SAMPLE_DATA) SampleData.loadIfEmpty(db);
+        TripGenerator.generateAll(db);
+
+        ScheduledExecutorService jobs = Executors.newSingleThreadScheduledExecutor(r -> { Thread t = new Thread(r, "jobs"); t.setDaemon(true); return t; });
+        jobs.scheduleWithFixedDelay(() -> { try { app.bookings.sweep(); } catch (Exception e) { System.err.println("sweep: " + e.getMessage()); } }, 30, 30, TimeUnit.SECONDS);
+        jobs.scheduleWithFixedDelay(() -> { try { TripGenerator.generateAll(db); } catch (Exception e) { System.err.println("trips: " + e.getMessage()); } }, 6, 6, TimeUnit.HOURS);
+
+        HttpServer server = HttpServer.create(new InetSocketAddress(Config.PORT), 0);
+        server.createContext("/api/", app::handleApi);
+        server.createContext("/", app::handleStatic);
+        server.setExecutor(Executors.newFixedThreadPool(24));
+        server.start();
+        System.out.println("First Choice is running.  Open  " + Config.BASE_URL + "  in your browser.");
+        System.out.println(" Database : " + (Config.JDBC_URL.startsWith("jdbc:h2") ? "H2 file (data/ folder)" : "external SQL database"));
+        System.out.println(" Payments : " + (razorpay ? "Razorpay (REAL payments)" : "DEMO gateway (no real money)"));
+        System.out.println(" Email    : " + (smtp != null ? "SMTP via " + Config.SMTP_HOST : "LOG MODE (emails are printed here and shown in Admin > Outbox)"));
         System.out.println("Press Ctrl+C to stop.");
     }
 
     // =====================================================================
-    //  API
+    //  request plumbing
     // =====================================================================
-    private void handleApi(HttpExchange ex) throws IOException {
-        if ("OPTIONS".equalsIgnoreCase(ex.getRequestMethod())) {
-            ex.getResponseHeaders().set("Allow", "GET, POST, OPTIONS");
-            ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
-            ex.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            ex.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-            ex.sendResponseHeaders(204, -1);
-            ex.close();
-            return;
-        }
-
-        try {
-            String rawPath = ex.getRequestURI().getPath();
-            if (rawPath.equals("/api") || rawPath.equals("/api/")) {
-                throw new ApiException(404, "Not found.");
+    private final class Req {
+        final HttpExchange ex; final String method; final String[] p; final Map<String, String> q = new HashMap<>();
+        private Map<String, Object> body; private Row user; private boolean userLoaded;
+        Req(HttpExchange ex) {
+            this.ex = ex; this.method = ex.getRequestMethod();
+            this.p = ex.getRequestURI().getPath().substring(5).split("/");
+            String raw = ex.getRequestURI().getRawQuery();
+            if (raw != null) for (String pair : raw.split("&")) {
+                int i = pair.indexOf('=');
+                q.put(URLDecoder.decode(i < 0 ? pair : pair.substring(0, i), StandardCharsets.UTF_8), i < 0 ? "" : URLDecoder.decode(pair.substring(i + 1), StandardCharsets.UTF_8));
             }
-            String sub = rawPath.startsWith("/api/") ? rawPath.substring(5) : rawPath.substring(4);
-            String[] p = Arrays.stream(sub.split("/")).filter(s -> !s.isBlank()).toArray(String[]::new);
-            if (p.length == 0) throw new ApiException(404, "Not found.");
+        }
+        String token() { String h = ex.getRequestHeaders().getFirst("Authorization"); return h != null && h.startsWith("Bearer ") ? h.substring(7).trim() : null; }
+        String ip() {
+            String fwd = ex.getRequestHeaders().getFirst("X-Forwarded-For");
+            if (Config.TRUST_PROXY && fwd != null && !fwd.isBlank()) return fwd.split(",")[0].trim();
+            return ex.getRemoteAddress().getAddress().getHostAddress();
+        }
+        Map<String, Object> body() throws IOException {
+            if (body == null) body = Json.parseObject(new String(ex.getRequestBody().readNBytes(100_000), StandardCharsets.UTF_8));
+            return body;
+        }
+        String str(String k) throws IOException { Object v = body().get(k); return v == null ? "" : v.toString(); }
+        Row user() { if (!userLoaded) { user = auth.userForToken(token()); userLoaded = true; } return user; }
+        Row requireUser() { Row u = user(); if (u == null) throw ApiException.unauthorized("Please log in to continue."); return u; }
+        Row requireAdmin() { Row u = requireUser(); if (!"ADMIN".equals(u.str("role"))) throw ApiException.forbidden("Admin access only."); return u; }
+        void method(String m) { if (!method.equals(m)) throw new ApiException(405, "Method not allowed."); }
+        LocalDate date(String k, LocalDate fallback) { String v = q.get(k); return v == null || v.isBlank() ? fallback : LocalDate.parse(v); }
+    }
 
-            Map<String, String> q = query(ex.getRequestURI().getRawQuery());
-            send(ex, 200, route(ex, ex.getRequestMethod(), p, q));
+    private void handleApi(HttpExchange ex) throws IOException {
+        try {
+            send(ex, 200, route(new Req(ex)));
         } catch (ApiException e) {
-            send(ex, e.status, map("error", e.getMessage()));
-        } catch (BookingException e) {
-            send(ex, 400, map("error", e.getMessage()));
+            send(ex, e.status, Map.of("error", e.getMessage()));
         } catch (DateTimeException e) {
-            send(ex, 400, map("error", "Invalid date or time. Use the format yyyy-MM-dd."));
+            send(ex, 400, Map.of("error", "Invalid date. Use the format yyyy-MM-dd."));
         } catch (IllegalArgumentException | ClassCastException e) {
-            send(ex, 400, map("error", "Invalid input. Please check the values and try again."));
+            send(ex, 400, Map.of("error", "Invalid input. Please check the values and try again."));
         } catch (Exception e) {
             e.printStackTrace();
-            send(ex, 500, map("error", "Server error. Please try again."));
+            send(ex, 500, Map.of("error", "Something went wrong on our side. Please try again."));
         }
     }
 
-    private Object route(HttpExchange ex, String method, String[] p, Map<String, String> q) throws Exception {
-        return switch (p[0]) {
-            case "register" -> register(ex, method);
-            case "login" -> login(ex, method);
-            case "logout" -> logout(ex, method);
-            case "me" -> me(ex, method);
-            case "cities" -> cities(method);
-            case "search" -> search(method, q);
-            case "schedules" -> schedule(method, p);
-            case "bookings" -> bookings(ex, method, p);
-            case "admin" -> adminApi(ex, method, p);
-            default -> throw new ApiException(404, "Not found.");
+    private Object route(Req r) throws Exception {
+        return switch (r.p[0]) {
+            case "auth" -> authRoutes(r);
+            case "me" -> meRoutes(r);
+            case "config" -> config();
+            case "cities" -> catalog.cities();
+            case "search" -> search(r);
+            case "trips" -> { r.method("GET"); yield catalog.tripDetail(r.p[1]); }
+            case "offers" -> catalog.offers();
+            case "coupons" -> couponCheck(r);
+            case "bookings" -> bookingRoutes(r);
+            case "track" -> track(r);
+            case "admin" -> adminRoutes(r);
+            default -> throw ApiException.notFound("Not found.");
         };
     }
 
-    private Object register(HttpExchange ex, String method) throws Exception {
-        need(method, "POST");
-        Map<String, Object> b = body(ex);
-        User u = auth.register(str(b, "name"), str(b, "email"), str(b, "password"), Role.PASSENGER);
-        return newSession(u);
-    }
-
-    private Object login(HttpExchange ex, String method) throws Exception {
-        need(method, "POST");
-        Map<String, Object> b = body(ex);
-        return newSession(auth.login(str(b, "email"), str(b, "password")));
-    }
-
-    private Object logout(HttpExchange ex, String method) throws Exception {
-        need(method, "POST");
-        String h = ex.getRequestHeaders().getFirst("Authorization");
-        if (h != null && h.startsWith("Bearer ")) {
-            sessions.remove(h.substring(7).trim());
-        }
-        return map("success", true);
-    }
-
-    private Object me(HttpExchange ex, String method) throws Exception {
-        need(method, "GET");
-        User u = requireUser(ex);
-        return map("name", u.name(), "email", u.email(), "role", u.role());
-    }
-
-    private Object cities(String method) throws Exception {
-        need(method, "GET");
-        TreeSet<String> set = new TreeSet<>();
-        for (Schedule s : booking.allSchedules()) { set.add(s.source()); set.add(s.destination()); }
-        return set;
-    }
-
-    private Object search(String method, Map<String, String> q) throws Exception {
-        need(method, "GET");
-        String from = q.getOrDefault("from", ""), to = q.getOrDefault("to", "");
-        if (from.isBlank() || to.isBlank()) throw new IllegalArgumentException("from/to required");
-        LocalDate date = LocalDate.parse(q.getOrDefault("date", ""));
-        List<Object> out = new ArrayList<>();
-        for (Schedule s : booking.search(from, to, date)) out.add(scheduleMap(s));
-        return out;
-    }
-
-    private Object schedule(String method, String[] p) throws Exception {
-        need(method, "GET");
-        if (p.length < 2) throw new ApiException(404, "Not found.");
-        Schedule s = booking.getSchedule(Integer.parseInt(p[1]));
-        Map<String, Object> m = scheduleMap(s);
-        m.put("bookedSeats", new ArrayList<>(booking.bookedSeats(s.id())));
-        return m;
-    }
-
-    private Object bookings(HttpExchange ex, String method, String[] p) throws Exception {
-        User user = requireUser(ex);
-        if (p.length == 1 && method.equals("GET")) {
-            List<Booking> mine = new ArrayList<>(booking.historyOf(user));
-            mine.sort(Comparator.comparing((Booking b) -> b.getSchedule().departure()).reversed());
-            List<Object> out = new ArrayList<>();
-            mine.forEach(b -> out.add(bookingMap(b)));
-            return out;
-        }
-        if (p.length == 1 && method.equals("POST")) {
-            Map<String, Object> b = body(ex);
-            if (!(b.get("passengers") instanceof List<?> raw) || raw.isEmpty())
-                throw new BookingException("Select at least one seat.");
-            List<PassengerSeat> passengers = new ArrayList<>();
-            for (Object o : raw) {
-                if (!(o instanceof Map<?, ?> pm)) throw new IllegalArgumentException("passenger");
-                String g = String.valueOf(pm.get("gender") == null ? "" : pm.get("gender")).trim();
-                passengers.add(new PassengerSeat(
-                        (int) numOf(pm.get("seatNo")),
-                        String.valueOf(pm.get("name") == null ? "" : pm.get("name")).trim(),
-                        (int) numOf(pm.get("age")),
-                        g.isEmpty() ? 'O' : Character.toUpperCase(g.charAt(0))));
-            }
-            return bookingMap(booking.book(user, (int) num(b, "scheduleId"), passengers));
-        }
-        if (p.length == 2 && method.equals("GET")) {
-            return bookingMap(findBooking(user, p[1]));
-        }
-        if (p.length == 3 && p[2].equals("cancel") && method.equals("POST")) {
-            return bookingMap(booking.cancel(user, p[1]));
-        }
-        throw new ApiException(404, "Not found.");
-    }
-
-    private Object adminApi(HttpExchange ex, String method, String[] p) throws Exception {
-        User user = requireUser(ex);
-        if (user.role() != Role.ADMIN) throw new ApiException(403, "Admin access only.");
-        String what = p.length > 1 ? p[1] : "";
-        switch (what) {
-            case "schedules" -> {
-                if (method.equals("POST")) {
-                    Map<String, Object> b = body(ex);
-                    Bus bus = admin.newBus(str(b, "busNumber"), str(b, "busName"),
-                            BusType.valueOf(str(b, "busType").toUpperCase()), (int) num(b, "totalSeats"));
-                    Schedule s = admin.addSchedule(bus, str(b, "from"), str(b, "to"),
-                            LocalDateTime.parse(str(b, "departure")), LocalDateTime.parse(str(b, "arrival")), num(b, "fare"));
-                    return scheduleMap(s);
-                }
-                need(method, "GET");
-                List<Object> out = new ArrayList<>();
-                booking.allSchedules().forEach(s -> out.add(scheduleMap(s)));
-                return out;
-            }
-            case "bookings" -> {
-                need(method, "GET");
-                List<Object> out = new ArrayList<>();
-                booking.allBookings().forEach(b -> out.add(bookingMap(b)));
-                return out;
-            }
-            case "report" -> {
-                need(method, "GET");
-                List<Object> rows = new ArrayList<>();
-                double total = 0;
-                for (Schedule s : booking.allSchedules()) {
-                    int sold = booking.bookedSeats(s.id()).size();
-                    double revenue = sold * s.fare();
-                    total += revenue;
-                    Map<String, Object> m = scheduleMap(s);
-                    m.put("sold", sold);
-                    m.put("revenue", revenue);
-                    rows.add(m);
-                }
-                return map("rows", rows, "totalRevenue", total);
-            }
-            default -> throw new ApiException(404, "Not found.");
-        }
-    }
-
-    // ---------- JSON shapes ----------
-    private Map<String, Object> scheduleMap(Schedule s) {
-        int free = s.bus().totalSeats() - booking.bookedSeats(s.id()).size();
-        return map("id", s.id(), "busName", s.bus().name(), "busNumber", s.bus().number(),
-                "busType", s.bus().type(), "source", s.source(), "destination", s.destination(),
-                "departure", s.departure().toString(), "arrival", s.arrival().toString(),
-                "fare", s.fare(), "totalSeats", s.bus().totalSeats(), "freeSeats", free);
-    }
-
-    private Map<String, Object> bookingMap(Booking b) {
-        List<Object> seats = new ArrayList<>();
-        for (PassengerSeat ps : b.getSeats())
-            seats.add(map("seatNo", ps.seatNo(), "name", ps.name(), "age", ps.age(), "gender", String.valueOf(ps.gender())));
-
-        Duration left = Duration.between(LocalDateTime.now(), b.getSchedule().departure());
-        boolean canCancel = b.getStatus() == BookingStatus.CONFIRMED && left.compareTo(Duration.ZERO) > 0;
-        double refundPct = canCancel ? BookingService.refundPercent(left) : 0;
-        double refundNow = Math.round(b.getTotalAmount() * refundPct * 100.0) / 100.0;
-
-        Map<String, Object> m = map("pnr", b.getPnr(), "status", b.getStatus(), "totalAmount", b.getTotalAmount(),
-                "refundAmount", b.getRefundAmount(), "bookedAt", b.getBookedAt().toString(),
-                "canCancel", canCancel, "refundIfCancelledNow", refundNow, "refundPercentNow", Math.round(refundPct * 100));
-        m.put("schedule", scheduleMap(b.getSchedule()));
-        m.put("seats", seats);
-        return m;
-    }
-
-    private Booking findBooking(User user, String pnr) throws ApiException {
-        List<Booking> pool = user.role() == Role.ADMIN ? booking.allBookings() : booking.historyOf(user);
-        return pool.stream().filter(b -> b.getPnr().equalsIgnoreCase(pnr)).findFirst()
-                .orElseThrow(() -> new ApiException(404, "No booking found for that PNR."));
-    }
-
-    // ---------- sessions & helpers ----------
-    private Map<String, Object> newSession(User u) {
-        byte[] raw = new byte[24];
-        random.nextBytes(raw);
-        String token = HexFormat.of().formatHex(raw);
-        sessions.put(token, u);
-        return map("token", token, "name", u.name(), "email", u.email(), "role", u.role());
-    }
-
-    private User requireUser(HttpExchange ex) throws ApiException {
-        String h = ex.getRequestHeaders().getFirst("Authorization");
-        User u = (h != null && h.startsWith("Bearer ")) ? sessions.get(h.substring(7).trim()) : null;
-        if (u == null) throw new ApiException(401, "Please log in to continue.");
-        return u;
-    }
-
-    private static void need(String actual, String expected) throws ApiException {
-        if (!actual.equals(expected)) throw new ApiException(405, "Method not allowed.");
-    }
-
-    private static Map<String, Object> body(HttpExchange ex) throws IOException {
-        try (var is = ex.getRequestBody()) {
-            byte[] raw = is.readNBytes(100_000);
-            return Json.parseObject(new String(raw, StandardCharsets.UTF_8));
-        }
-    }
-
-    private static String str(Map<String, Object> m, String key) {
-        Object v = m.get(key);
-        return v == null ? "" : v.toString().trim();
-    }
-
-    private static double numOf(Object v) {
-        if (v instanceof Number n) return n.doubleValue();
-        if (v instanceof String s) return Double.parseDouble(s.trim());
-        throw new IllegalArgumentException("number expected");
-    }
-
-    private static double num(Map<String, Object> m, String key) { return numOf(m.get(key)); }
-
-    private static Map<String, String> query(String raw) {
-        Map<String, String> q = new HashMap<>();
-        if (raw == null || raw.isEmpty()) return q;
-        for (String pair : raw.split("&")) {
-            int i = pair.indexOf('=');
-            String k = i < 0 ? pair : pair.substring(0, i);
-            String v = i < 0 ? "" : pair.substring(i + 1);
-            q.put(URLDecoder.decode(k, StandardCharsets.UTF_8), URLDecoder.decode(v, StandardCharsets.UTF_8));
-        }
-        return q;
-    }
-
-    private static Map<String, Object> map(Object... kv) {
+    // =====================================================================
+    //  public + account routes
+    // =====================================================================
+    private Object config() {
         Map<String, Object> m = new LinkedHashMap<>();
-        for (int i = 0; i < kv.length; i += 2) m.put((String) kv[i], kv[i + 1]);
+        m.put("paymentProvider", bookings.gateway().name());
+        m.put("holdMinutes", Config.HOLD_MINUTES);
+        m.put("emailLogMode", notifier.isLogMode());
         return m;
+    }
+
+    private Object search(Req r) {
+        r.method("GET");
+        String from = r.q.getOrDefault("from", ""), to = r.q.getOrDefault("to", "");
+        if (from.isBlank() || to.isBlank()) throw ApiException.bad("Enter both a starting city and a destination.");
+        if (from.trim().equalsIgnoreCase(to.trim())) throw ApiException.bad("Starting city and destination must be different.");
+        LocalDate date = LocalDate.parse(r.q.getOrDefault("date", ""));
+        if (date.isBefore(LocalDate.now())) throw ApiException.bad("Pick a travel date from today onwards.");
+        return catalog.search(from, to, date);
+    }
+
+    private Object authRoutes(Req r) throws Exception {
+        String what = r.p.length > 1 ? r.p[1] : "";
+        r.method("POST");
+        switch (what) {
+            case "register": return auth.register(r.str("name"), r.str("email"), r.str("phone"), r.str("password"), r.ip());
+            case "login": return auth.login(r.str("email"), r.str("password"), r.ip());
+            case "logout": auth.logout(r.token()); return Map.of("ok", true);
+            case "forgot": auth.forgotPassword(r.str("email"), r.ip());
+                return Map.of("ok", true, "message", "If an account exists for that email, we have sent a reset link. It is valid for 30 minutes.");
+            case "reset": auth.resetPassword(r.str("token"), r.str("password")); return Map.of("ok", true);
+            case "verify": auth.verifyEmail(r.str("token")); return Map.of("ok", true);
+            case "resend-verification": auth.resendVerification(r.requireUser(), r.ip()); return Map.of("ok", true);
+            default: throw ApiException.notFound("Not found.");
+        }
+    }
+
+    private Object meRoutes(Req r) throws Exception {
+        Row u = r.requireUser();
+        if (r.p.length == 1 && r.method.equals("GET")) return AuthService.userMap(u);
+        if (r.p.length == 1 && r.method.equals("PUT")) return auth.updateProfile(u.str("id"), r.str("name"), r.str("phone"));
+        if (r.p.length == 2 && r.p[1].equals("password") && r.method.equals("POST")) {
+            auth.changePassword(u, r.str("current"), r.str("next"), r.token());
+            return Map.of("ok", true);
+        }
+        if (r.p.length == 2 && r.p[1].equals("logout-everywhere") && r.method.equals("POST")) { auth.logoutEverywhere(u.str("id")); return Map.of("ok", true); }
+        throw ApiException.notFound("Not found.");
+    }
+
+    private Object couponCheck(Req r) throws Exception {
+        r.method("POST");
+        r.requireUser();
+        Row trip = catalog.tripRow(r.str("tripId"));
+        int n = Math.max(1, Math.min(6, (int) Double.parseDouble(r.str("seatCount").isEmpty() ? "1" : r.str("seatCount"))));
+        long base = trip.lng("fare_paise") * n;
+        long discount = catalog.couponDiscount(r.str("code"), base);
+        return Map.of("code", r.str("code").trim().toUpperCase(), "discount", discount / 100.0, "total", (base - discount) / 100.0);
+    }
+
+    // =====================================================================
+    //  bookings
+    // =====================================================================
+    private Object bookingRoutes(Req r) throws Exception {
+        Row u = r.requireUser();
+        if (r.p.length == 1) {
+            if (r.method.equals("GET")) return bookings.mine(u);
+            r.method("POST");
+            List<BookingService.SeatReq> seats = new ArrayList<>();
+            if (!(r.body().get("seats") instanceof List<?> list)) throw ApiException.bad("Select at least one seat.");
+            for (Object o : list) {
+                if (!(o instanceof Map<?, ?> m)) throw ApiException.bad("Invalid passenger details.");
+                Object age = m.get("age");
+                seats.add(new BookingService.SeatReq(str(m.get("label")), str(m.get("name")),
+                        age == null ? 0 : (int) Double.parseDouble(age.toString()), str(m.get("gender"))));
+            }
+            return bookings.create(u, r.str("tripId"), seats, r.str("boarding"), r.str("dropping"), r.str("phone"), r.str("email"), r.str("coupon"));
+        }
+        String pnr = r.p[1];
+        if (r.p.length == 2) { r.method("GET"); return bookings.viewFor(u, pnr); }
+        switch (r.p[2]) {
+            case "pay": r.method("POST"); return bookings.pay(u, pnr, r.body());
+            case "abandon": r.method("POST"); bookings.abandon(u, pnr); return Map.of("ok", true);
+            case "cancel": {
+                r.method("POST");
+                List<String> labels = new ArrayList<>();
+                if (r.body().get("seats") instanceof List<?> l) for (Object o : l) labels.add(String.valueOf(o));
+                return bookings.cancel(u, pnr, labels);
+            }
+            case "review": {
+                r.method("POST");
+                bookings.review(u, pnr, (int) Double.parseDouble(r.str("rating").isEmpty() ? "0" : r.str("rating")), r.str("text"));
+                return Map.of("ok", true);
+            }
+            default: throw ApiException.notFound("Not found.");
+        }
+    }
+
+    private static String str(Object o) { return o == null ? "" : o.toString(); }
+
+    private Object track(Req r) throws Exception {
+        r.method("POST");
+        if (!limiter.allow("track:" + r.ip(), 20, 600)) throw new ApiException(429, "Too many lookups. Please wait a few minutes.");
+        return bookings.track(r.str("pnr"), r.str("contact"));
+    }
+
+    // =====================================================================
+    //  admin
+    // =====================================================================
+    private Object adminRoutes(Req r) throws Exception {
+        r.requireAdmin();
+        String what = r.p.length > 1 ? r.p[1] : "";
+        LocalDate today = LocalDate.now();
+        switch (what) {
+            case "report": return admin.report(r.date("from", today.minusDays(29)), r.date("to", today));
+            case "operators":
+                if (r.method.equals("POST")) return Map.of("id", admin.addOperator(r.body()));
+                return admin.operators();
+            case "buses":
+                if (r.method.equals("POST")) return Map.of("id", admin.addBus(r.body()));
+                return admin.buses();
+            case "services":
+                if (r.p.length == 4 && r.p[3].equals("active")) { r.method("POST"); admin.setServiceActive(r.p[2], Boolean.parseBoolean(r.str("active"))); return Map.of("ok", true); }
+                if (r.method.equals("POST")) return Map.of("id", admin.addService(r.body()));
+                return admin.services();
+            case "trips":
+                if (r.p.length == 4 && r.p[3].equals("cancel")) { r.method("POST"); return Map.of("cancelledBookings", bookings.cancelTrip(r.p[2], r.str("reason"))); }
+                if (r.p.length == 4 && r.p[3].equals("delay")) { r.method("POST"); admin.setDelay(r.p[2], (int) Double.parseDouble(r.str("minutes"))); return Map.of("ok", true); }
+                return admin.trips(r.date("date", today));
+            case "coupons":
+                if (r.p.length == 4 && r.p[3].equals("active")) { r.method("POST"); admin.setCouponActive(r.p[2], Boolean.parseBoolean(r.str("active"))); return Map.of("ok", true); }
+                if (r.method.equals("POST")) { admin.addCoupon(r.body()); return Map.of("ok", true); }
+                return admin.coupons();
+            case "bookings": return admin.bookings(r.q.get("pnr"), r.q.get("status"), r.date("from", null), r.date("to", null));
+            case "users": return auth.listUsers();
+            case "outbox": return admin.outbox();
+            case "refunds": return admin.failedRefunds();
+            case "generate-trips": r.method("POST"); return Map.of("created", TripGenerator.generateAll(db));
+            default: throw ApiException.notFound("Not found.");
+        }
+    }
+
+    // =====================================================================
+    //  responses + static files
+    // =====================================================================
+    private static void headers(HttpExchange ex) {
+        var h = ex.getResponseHeaders();
+        h.set("X-Content-Type-Options", "nosniff");
+        h.set("X-Frame-Options", "DENY");
+        h.set("Referrer-Policy", "same-origin");
+        h.set("Content-Security-Policy", "default-src 'self'; script-src 'self' https://checkout.razorpay.com; "
+                + "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
+                + "img-src 'self' data: https://*.razorpay.com; frame-src https://api.razorpay.com https://checkout.razorpay.com; "
+                + "connect-src 'self' https://*.razorpay.com");
     }
 
     private static void send(HttpExchange ex, int status, Object payload) throws IOException {
         byte[] bytes = Json.stringify(payload).getBytes(StandardCharsets.UTF_8);
+        headers(ex);
         ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
-        ex.getResponseHeaders().set("Cache-Control", "no-store, no-cache, must-revalidate");
-        ex.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
-        ex.getResponseHeaders().set("X-Frame-Options", "DENY");
-        ex.getResponseHeaders().set("Referrer-Policy", "strict-origin-when-cross-origin");
+        ex.getResponseHeaders().set("Cache-Control", "no-store");
         ex.sendResponseHeaders(status, bytes.length);
         ex.getResponseBody().write(bytes);
         ex.close();
     }
 
-    // =====================================================================
-    //  Static files
-    // =====================================================================
     private void handleStatic(HttpExchange ex) throws IOException {
         String path = ex.getRequestURI().getPath();
         if (path.equals("/")) path = "/index.html";
         Path file = webRoot.resolve(path.substring(1)).normalize();
+        headers(ex);
         if (!file.startsWith(webRoot) || !Files.isRegularFile(file)) {
             byte[] msg = "Page not found".getBytes(StandardCharsets.UTF_8);
             ex.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
-            ex.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
-            ex.getResponseHeaders().set("X-Frame-Options", "DENY");
             ex.sendResponseHeaders(404, msg.length);
-            if (!ex.getRequestMethod().equalsIgnoreCase("HEAD")) {
-                ex.getResponseBody().write(msg);
-            }
+            ex.getResponseBody().write(msg);
             ex.close();
             return;
         }
         byte[] bytes = Files.readAllBytes(file);
-        ex.getResponseHeaders().set("Content-Type", contentType(file.getFileName().toString()));
-        ex.getResponseHeaders().set("Cache-Control", "no-cache, no-store, must-revalidate");
-        ex.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
-        ex.getResponseHeaders().set("X-Frame-Options", "DENY");
-        ex.getResponseHeaders().set("Referrer-Policy", "strict-origin-when-cross-origin");
+        String n = file.getFileName().toString();
+        ex.getResponseHeaders().set("Content-Type", n.endsWith(".html") ? "text/html; charset=utf-8" : n.endsWith(".css") ? "text/css; charset=utf-8"
+                : n.endsWith(".js") ? "text/javascript; charset=utf-8" : n.endsWith(".svg") ? "image/svg+xml" : "application/octet-stream");
+        ex.getResponseHeaders().set("Cache-Control", "no-cache");
         ex.sendResponseHeaders(200, bytes.length);
-        if (!ex.getRequestMethod().equalsIgnoreCase("HEAD")) {
-            ex.getResponseBody().write(bytes);
-        }
+        ex.getResponseBody().write(bytes);
         ex.close();
-    }
-
-    private static String contentType(String name) {
-        String lower = name.toLowerCase();
-        if (lower.endsWith(".html")) return "text/html; charset=utf-8";
-        if (lower.endsWith(".css")) return "text/css; charset=utf-8";
-        if (lower.endsWith(".js")) return "text/javascript; charset=utf-8";
-        if (lower.endsWith(".json")) return "application/json; charset=utf-8";
-        if (lower.endsWith(".svg")) return "image/svg+xml";
-        if (lower.endsWith(".png")) return "image/png";
-        if (lower.endsWith(".ico")) return "image/x-icon";
-        if (lower.endsWith(".webp")) return "image/webp";
-        if (lower.endsWith(".woff2")) return "font/woff2";
-        if (lower.endsWith(".woff")) return "font/woff";
-        if (lower.endsWith(".txt")) return "text/plain; charset=utf-8";
-        return "application/octet-stream";
     }
 }
